@@ -28,3 +28,13 @@ Terminal window 2:
 ```bash
 uv run scripts/serve_policy.py --env DROID
 ```
+
+For a custom Piper checkpoint, start the server with checkpoint mode and then point the client at the `PIPER` environment:
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_piper --policy.dir=checkpoints/pi05_piper/<exp>/<step>
+```
+
+```bash
+uv run examples/simple_client/main.py --env PIPER
+```
