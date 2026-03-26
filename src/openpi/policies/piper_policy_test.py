@@ -115,6 +115,6 @@ def test_pi05_piper_config_registration():
     config = _config.get_config("pi05_piper")
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    assert data_config.repo_id == "richardshkim/piper_banana_v2"
+    assert data_config.repo_id == "richardshkim/piper_banana_v2_openpi"
     assert data_config.action_sequence_keys == ("action",)
     assert isinstance(data_config.data_transforms.inputs[0], piper_policy.PiperInputs)
