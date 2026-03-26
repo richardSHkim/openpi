@@ -1,29 +1,19 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
 import math
-import os
 from pathlib import Path
 import shutil
-import sys
+import subprocess
 import tempfile
+from typing import Any
 
-from huggingface_hub.constants import HF_HOME
 import jsonlines
-import numpy as np
-from PIL import Image
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 DEFAULT_CHUNK_SIZE = 1000
-DEFAULT_FEATURES = {
-    "timestamp": {"dtype": "float32", "shape": [1], "names": None},
-    "frame_index": {"dtype": "int64", "shape": [1], "names": None},
-    "episode_index": {"dtype": "int64", "shape": [1], "names": None},
-    "index": {"dtype": "int64", "shape": [1], "names": None},
-    "task_index": {"dtype": "int64", "shape": [1], "names": None},
-}
 DATA_PATH_TEMPLATE = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 VIDEO_PATH_TEMPLATE = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
 MARKER_PATH = ".piper_source.json"
@@ -32,7 +22,7 @@ PIPER_STATE_KEY = "observation.state"
 PIPER_BASE_IMAGE_KEY = "observation.images.base"
 PIPER_WRIST_IMAGE_KEY = "observation.images.wrist"
 REQUIRED_VIDEO_KEYS = (PIPER_BASE_IMAGE_KEY, PIPER_WRIST_IMAGE_KEY)
-HF_LEROBOT_HOME = Path(os.getenv("HF_LEROBOT_HOME", Path(HF_HOME) / "lerobot")).expanduser()
+MIN_VIDEO_DURATION = 1e-6
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         "--dst-root",
         type=Path,
         default=None,
-        help="Destination HF_LEROBOT_HOME-like root. Defaults to $HF_LEROBOT_HOME.",
+        help="Destination base directory. Defaults to the base directory of --src.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite any existing staged dataset.")
     return parser.parse_args()
@@ -60,7 +50,7 @@ def main() -> None:
     args = parse_args()
     src = args.src.expanduser().resolve()
     repo_id = args.repo_id or infer_repo_id(src)
-    dst_root = args.dst_root.expanduser().resolve() if args.dst_root is not None else HF_LEROBOT_HOME
+    dst_root = args.dst_root.expanduser().resolve() if args.dst_root is not None else infer_dst_root(src)
     dst = dst_root / repo_id
 
     if not src.exists():
@@ -68,8 +58,8 @@ def main() -> None:
 
     source_info = load_json(src / "meta" / "info.json")
     source_version = source_info.get("codebase_version")
-    tasks = load_tasks(src)
-    validate_piper_metadata(source_info, tasks)
+    tasks = load_tasks(src, source_version)
+    validate_piper_metadata(source_info, tasks, source_version)
 
     if source_version == "v2.1" and src == dst:
         print(f"Validated existing staged dataset in place: {dst}")
@@ -85,7 +75,7 @@ def main() -> None:
     if source_version != "v3.0":
         raise ValueError(f"Unsupported dataset version {source_version!r}. Expected 'v2.1' or 'v3.0'.")
 
-    convert_v30_to_v21(src, dst, repo_id, source_info)
+    convert_v30_to_v21(src, dst, repo_id, source_info, tasks)
     print(f"Converted Piper dataset to openpi-compatible v2.1 format at {dst}")
 
 
@@ -95,24 +85,36 @@ def infer_repo_id(src: Path) -> str:
     return src.name
 
 
+def infer_dst_root(src: Path) -> Path:
+    if src.parent.name:
+        return src.parent.parent
+    return src.parent
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Required metadata file not found: {path}")
     return json.loads(path.read_text())
 
 
-def load_tasks(src: Path) -> list[dict]:
-    tasks_path = src / "meta" / "tasks.jsonl"
-    if not tasks_path.exists():
-        raise FileNotFoundError(f"Required task metadata file not found: {tasks_path}")
-    with jsonlines.open(tasks_path) as reader:
-        tasks = list(reader)
+def load_tasks(src: Path, source_version: str | None) -> list[dict]:
+    if source_version == "v3.0":
+        tasks_path = src / "meta" / "tasks.parquet"
+        if not tasks_path.exists():
+            raise FileNotFoundError(f"Required task metadata file not found: {tasks_path}")
+        tasks = pq.read_table(tasks_path).to_pylist()
+    else:
+        tasks_path = src / "meta" / "tasks.jsonl"
+        if not tasks_path.exists():
+            raise FileNotFoundError(f"Required task metadata file not found: {tasks_path}")
+        with jsonlines.open(tasks_path) as reader:
+            tasks = list(reader)
     if not tasks:
         raise ValueError(f"No tasks found in {tasks_path}")
     return tasks
 
 
-def validate_piper_metadata(info: dict, tasks: list[dict]) -> None:
+def validate_piper_metadata(info: dict, tasks: list[dict], source_version: str | None) -> None:
     features = info.get("features", {})
     action_feature = features.get(PIPER_ACTION_KEY)
     state_feature = features.get(PIPER_STATE_KEY)
@@ -134,7 +136,19 @@ def validate_piper_metadata(info: dict, tasks: list[dict]) -> None:
             raise ValueError(f"{key} must be stored as image or video, found {feature.get('dtype')!r}.")
 
     if not all(task.get("task") for task in tasks):
-        raise ValueError("All tasks in tasks.jsonl must contain a non-empty 'task' field.")
+        raise ValueError(f"All tasks in {source_version or 'dataset'} metadata must contain a non-empty 'task' field.")
+
+
+def _to_serializable(value: Any) -> Any:
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _to_serializable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable(item) for item in value]
+    return value
 
 
 def ensure_destination(dst: Path, *, force: bool) -> None:
@@ -183,322 +197,277 @@ def validate_v21_layout(src: Path) -> None:
             raise FileNotFoundError(f"No staged videos found for {video_key!r} under {src / 'videos'}")
 
 
-def convert_v30_to_v21(src: Path, dst: Path, repo_id: str, source_info: dict) -> None:
-    dataset_cls, metadata_cls, encode_video_frames = load_v3_lerobot()
-    meta = metadata_cls(repo_id=repo_id, root=src)
-    if meta.total_episodes <= 0:
-        raise ValueError(f"No episodes found in source dataset: {src}")
+def load_episode_records(src: Path) -> list[dict[str, Any]]:
+    episodes_dir = src / "meta" / "episodes"
+    pq_paths = sorted(episodes_dir.glob("chunk-*/file-*.parquet"))
+    if not pq_paths:
+        raise FileNotFoundError(f"No episode parquet files found in {episodes_dir}.")
+
+    records: list[dict[str, Any]] = []
+    for pq_path in pq_paths:
+        records.extend(pq.read_table(pq_path).to_pylist())
+
+    records.sort(key=lambda rec: int(rec["episode_index"]))
+    if not records:
+        raise ValueError(f"No episodes found in {episodes_dir}.")
+    return records
+
+
+def convert_info(source_info: dict, new_root: Path, episode_records: list[dict[str, Any]], video_keys: list[str]) -> None:
+    info = json.loads(json.dumps(source_info))
+    total_episodes = int(info.get("total_episodes") or len(episode_records))
+    chunks_size = int(info.get("chunks_size", DEFAULT_CHUNK_SIZE))
+
+    info["codebase_version"] = "v2.1"
+    info["data_path"] = DATA_PATH_TEMPLATE
+    info["video_path"] = VIDEO_PATH_TEMPLATE if video_keys else None
+    info.pop("data_files_size_in_mb", None)
+    info.pop("video_files_size_in_mb", None)
+    info["total_chunks"] = math.ceil(total_episodes / chunks_size) if total_episodes > 0 else 0
+    info["total_videos"] = total_episodes * len(video_keys)
+
+    write_json(info, new_root / "meta" / "info.json")
+
+
+def copy_global_stats(src: Path, new_root: Path) -> None:
+    source_stats = src / "meta" / "stats.json"
+    if source_stats.exists():
+        target_stats = new_root / "meta" / "stats.json"
+        target_stats.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_stats, target_stats)
+
+
+def convert_tasks(tasks: list[dict], new_root: Path) -> None:
+    out_path = new_root / "meta" / "tasks.jsonl"
+    rows = [
+        {
+            "task_index": int(task["task_index"]),
+            "task": str(task["task"]).strip(),
+        }
+        for task in sorted(tasks, key=lambda row: int(row["task_index"]))
+    ]
+    write_jsonl(rows, out_path)
+
+
+def _group_episodes_by_data_file(
+    episode_records: list[dict[str, Any]],
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for record in episode_records:
+        grouped[(int(record["data/chunk_index"]), int(record["data/file_index"]))].append(record)
+    return grouped
+
+
+def convert_data(
+    src: Path,
+    new_root: Path,
+    episode_records: list[dict[str, Any]],
+    source_data_path: str,
+    chunks_size: int,
+) -> None:
+    grouped = _group_episodes_by_data_file(episode_records)
+    print(f"Converting {len(grouped)} consolidated data parquet file(s)...")
+
+    for (chunk_idx, file_idx), records in grouped.items():
+        source_path = src / source_data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Expected source parquet file not found: {source_path}")
+
+        table = pq.read_table(source_path)
+        records = sorted(records, key=lambda rec: int(rec["dataset_from_index"]))
+        file_offset = int(records[0]["dataset_from_index"])
+
+        for record in records:
+            episode_index = int(record["episode_index"])
+            start = int(record["dataset_from_index"]) - file_offset
+            stop = int(record["dataset_to_index"]) - file_offset
+            length = stop - start
+            if length <= 0:
+                raise ValueError(
+                    "Invalid episode length computed during data conversion: "
+                    f"episode_index={episode_index}, length={length}"
+                )
+
+            episode_table = table.slice(start, length)
+            dest_chunk = episode_index // chunks_size
+            dest_path = new_root / DATA_PATH_TEMPLATE.format(
+                episode_chunk=dest_chunk,
+                episode_index=episode_index,
+            )
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(episode_table, dest_path)
+
+
+def _group_episodes_by_video_file(
+    episode_records: list[dict[str, Any]], video_key: str
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    chunk_column = f"videos/{video_key}/chunk_index"
+    file_column = f"videos/{video_key}/file_index"
+
+    for record in episode_records:
+        chunk_idx = record.get(chunk_column)
+        file_idx = record.get(file_column)
+        if chunk_idx is None or file_idx is None:
+            continue
+        grouped[(int(chunk_idx), int(file_idx))].append(record)
+
+    return grouped
+
+
+def _extract_video_segment(src: Path, dst: Path, start: float, end: float) -> None:
+    duration = max(end - start, MIN_VIDEO_DURATION)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start:.6f}",
+        "-i",
+        str(src),
+        "-t",
+        f"{duration:.6f}",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "1",
+        "-y",
+        str(dst),
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=300, capture_output=True, text=True)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffmpeg timed out while splitting video '{src}' -> '{dst}'") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg executable not found; it is required for Piper dataset conversion.") from exc
+    except subprocess.CalledProcessError as exc:
+        error_msg = f"ffmpeg failed while splitting video '{src}' into '{dst}'"
+        if exc.stderr:
+            error_msg += f". Error: {exc.stderr.strip()}"
+        raise RuntimeError(error_msg) from exc
+
+
+def convert_videos(
+    src: Path,
+    new_root: Path,
+    episode_records: list[dict[str, Any]],
+    source_video_path: str | None,
+    video_keys: list[str],
+    chunks_size: int,
+) -> None:
+    if not video_keys:
+        print("No video features detected; skipping video conversion.")
+        return
+    if source_video_path is None:
+        raise ValueError("Source dataset is missing a video_path template in info.json.")
+
+    total_segments = 0
+    for video_key in video_keys:
+        grouped = _group_episodes_by_video_file(episode_records, video_key)
+        total_segments += sum(len(records) for records in grouped.values())
+    print(f"Splitting {total_segments} video segment(s) across {len(video_keys)} camera stream(s)...")
+
+    for video_key in video_keys:
+        grouped = _group_episodes_by_video_file(episode_records, video_key)
+        for (chunk_idx, file_idx), records in grouped.items():
+            src_path = src / source_video_path.format(video_key=video_key, chunk_index=chunk_idx, file_index=file_idx)
+            if not src_path.exists():
+                raise FileNotFoundError(f"Expected source video file not found: {src_path}")
+
+            records = sorted(records, key=lambda rec: float(rec[f"videos/{video_key}/from_timestamp"]))
+            for record in records:
+                episode_index = int(record["episode_index"])
+                start = float(record[f"videos/{video_key}/from_timestamp"])
+                end = float(record[f"videos/{video_key}/to_timestamp"])
+
+                dest_chunk = episode_index // chunks_size
+                dest_path = new_root / VIDEO_PATH_TEMPLATE.format(
+                    episode_chunk=dest_chunk,
+                    video_key=video_key,
+                    episode_index=episode_index,
+                )
+                _extract_video_segment(src_path, dest_path, start=start, end=end)
+
+
+def _extract_episode_stats(record: dict[str, Any]) -> dict[str, Any]:
+    stats: dict[str, Any] = {}
+    for key, value in record.items():
+        if not key.startswith("stats/"):
+            continue
+        parts = key.split("/")[1:]
+        node = stats
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = _to_serializable(value)
+    return stats
+
+
+def convert_episodes_metadata(new_root: Path, episode_records: list[dict[str, Any]]) -> None:
+    episodes_path = new_root / "meta" / "episodes.jsonl"
+    stats_path = new_root / "meta" / "episodes_stats.jsonl"
+
+    episodes_path.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        jsonlines.open(episodes_path, mode="w") as episodes_writer,
+        jsonlines.open(stats_path, mode="w") as stats_writer,
+    ):
+        for record in episode_records:
+            legacy_episode = {
+                key: _to_serializable(value)
+                for key, value in record.items()
+                if not key.startswith("data/")
+                and not key.startswith("videos/")
+                and not key.startswith("stats/")
+                and not key.startswith("meta/")
+                and key not in {"dataset_from_index", "dataset_to_index"}
+            }
+            if "length" not in legacy_episode:
+                legacy_episode["length"] = int(record["dataset_to_index"]) - int(record["dataset_from_index"])
+
+            episodes_writer.write(legacy_episode)
+            stats_writer.write(
+                {
+                    "episode_index": int(record["episode_index"]),
+                    "stats": _extract_episode_stats(record),
+                }
+            )
+
+
+def convert_v30_to_v21(src: Path, dst: Path, repo_id: str, source_info: dict, tasks: list[dict]) -> None:
+    video_keys = [
+        key
+        for key in REQUIRED_VIDEO_KEYS
+        if source_info.get("features", {}).get(key, {}).get("dtype") == "video"
+    ]
+    if len(video_keys) != len(REQUIRED_VIDEO_KEYS):
+        raise NotImplementedError(
+            "Fast Piper v3->v2.1 conversion currently expects video-backed camera features for "
+            f"{REQUIRED_VIDEO_KEYS}."
+        )
+
+    episode_records = load_episode_records(src)
+    chunks_size = int(source_info.get("chunks_size", DEFAULT_CHUNK_SIZE))
+    print(f"Loaded {len(episode_records)} episode metadata record(s) from {src}.")
 
     work_root = Path(tempfile.mkdtemp(prefix=f".{dst.name}.tmp.", dir=dst.parent))
     staging_dir = work_root / "dataset"
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks_to_index: dict[str, int] = {}
-    episodes_rows: list[dict] = []
-    episodes_stats_rows: list[dict] = []
-    all_episode_stats: list[dict[str, dict[str, np.ndarray]]] = []
-    output_features: dict | None = None
-    total_frames = 0
-
     try:
-        for episode_index in range(meta.total_episodes):
-            dataset = dataset_cls(repo_id=repo_id, root=src, episodes=[episode_index], download_videos=True)
-            episode_length = len(dataset)
-            if episode_length <= 0:
-                raise ValueError(f"Episode {episode_index} is empty.")
-
-            episode_chunk = episode_index // DEFAULT_CHUNK_SIZE
-            episode_task: str | None = None
-            task_index: int | None = None
-
-            actions: list[np.ndarray] = []
-            states: list[np.ndarray] = []
-            timestamps: list[float] = []
-            frame_indices: list[int] = []
-            task_indices: list[int] = []
-
-            with tempfile.TemporaryDirectory(prefix=f"piper_ep_{episode_index:06d}_") as temp_dir_name:
-                temp_dir = Path(temp_dir_name)
-                frame_dirs = {
-                    key: temp_dir / key
-                    for key in REQUIRED_VIDEO_KEYS
-                }
-                for frame_dir in frame_dirs.values():
-                    frame_dir.mkdir(parents=True, exist_ok=True)
-
-                for local_frame_index in range(episode_length):
-                    item = dataset[local_frame_index]
-                    task = normalize_task(item.get("task"))
-                    if episode_task is None:
-                        episode_task = task
-                        task_index = tasks_to_index.setdefault(task, len(tasks_to_index))
-                    elif task != episode_task:
-                        raise ValueError(
-                            f"Episode {episode_index} contains multiple tasks: {episode_task!r} vs {task!r}."
-                        )
-
-                    state = as_float_vector(item[PIPER_STATE_KEY], PIPER_STATE_KEY)
-                    action = as_float_vector(item[PIPER_ACTION_KEY], PIPER_ACTION_KEY)
-                    base_image = to_uint8_hwc(item[PIPER_BASE_IMAGE_KEY], PIPER_BASE_IMAGE_KEY)
-                    wrist_image = to_uint8_hwc(item[PIPER_WRIST_IMAGE_KEY], PIPER_WRIST_IMAGE_KEY)
-
-                    if output_features is None:
-                        output_features = build_output_features(
-                            source_info["features"],
-                            base_image.shape,
-                            wrist_image.shape,
-                            int(meta.fps),
-                        )
-
-                    actions.append(action)
-                    states.append(state)
-                    timestamps.append(float(np.asarray(item["timestamp"]).item()))
-                    frame_indices.append(int(np.asarray(item["frame_index"]).item()))
-                    task_indices.append(task_index)
-
-                    Image.fromarray(base_image).save(frame_dirs[PIPER_BASE_IMAGE_KEY] / f"frame-{local_frame_index:06d}.png")
-                    Image.fromarray(wrist_image).save(
-                        frame_dirs[PIPER_WRIST_IMAGE_KEY] / f"frame-{local_frame_index:06d}.png"
-                    )
-
-                if episode_task is None or task_index is None:
-                    raise ValueError(f"Episode {episode_index} is missing task metadata.")
-
-                for video_key in REQUIRED_VIDEO_KEYS:
-                    video_path = staging_dir / VIDEO_PATH_TEMPLATE.format(
-                        episode_chunk=episode_chunk,
-                        video_key=video_key,
-                        episode_index=episode_index,
-                    )
-                    encode_video_frames(frame_dirs[video_key], video_path, int(meta.fps), overwrite=True)
-
-            action_array = np.stack(actions, axis=0).astype(np.float32)
-            state_array = np.stack(states, axis=0).astype(np.float32)
-            timestamp_array = np.asarray(timestamps, dtype=np.float32)
-            frame_index_array = np.asarray(frame_indices, dtype=np.int64)
-            episode_index_array = np.full((episode_length,), episode_index, dtype=np.int64)
-            index_array = np.arange(total_frames, total_frames + episode_length, dtype=np.int64)
-            task_index_array = np.asarray(task_indices, dtype=np.int64)
-
-            parquet_path = staging_dir / DATA_PATH_TEMPLATE.format(
-                episode_chunk=episode_chunk,
-                episode_index=episode_index,
-            )
-            write_episode_parquet(
-                parquet_path,
-                {
-                    PIPER_ACTION_KEY: action_array,
-                    PIPER_STATE_KEY: state_array,
-                    "timestamp": timestamp_array,
-                    "frame_index": frame_index_array,
-                    "episode_index": episode_index_array,
-                    "index": index_array,
-                    "task_index": task_index_array,
-                },
-            )
-
-            episode_stats = {
-                PIPER_ACTION_KEY: compute_feature_stats(action_array),
-                PIPER_STATE_KEY: compute_feature_stats(state_array),
-                "timestamp": compute_feature_stats(timestamp_array),
-                "frame_index": compute_feature_stats(frame_index_array),
-                "episode_index": compute_feature_stats(episode_index_array),
-                "index": compute_feature_stats(index_array),
-                "task_index": compute_feature_stats(task_index_array),
-            }
-            all_episode_stats.append(episode_stats)
-            episodes_rows.append({"episode_index": episode_index, "tasks": [episode_task], "length": episode_length})
-            episodes_stats_rows.append({"episode_index": episode_index, "stats": serialize_tree(episode_stats)})
-            total_frames += episode_length
-
-        if output_features is None:
-            raise ValueError(f"No frames were converted from {src}")
-
-        stats = aggregate_stats(all_episode_stats)
-        write_json(
-            {
-                "codebase_version": "v2.1",
-                "robot_type": source_info.get("robot_type", "piper_follower"),
-                "total_episodes": meta.total_episodes,
-                "total_frames": total_frames,
-                "total_tasks": len(tasks_to_index),
-                "total_videos": meta.total_episodes * len(REQUIRED_VIDEO_KEYS),
-                "total_chunks": math.ceil(meta.total_episodes / DEFAULT_CHUNK_SIZE),
-                "chunks_size": DEFAULT_CHUNK_SIZE,
-                "fps": int(meta.fps),
-                "splits": {"train": f"0:{meta.total_episodes}"},
-                "data_path": DATA_PATH_TEMPLATE,
-                "video_path": VIDEO_PATH_TEMPLATE,
-                "features": output_features,
-            },
-            staging_dir / "meta" / "info.json",
-        )
-        write_json(serialize_tree(stats), staging_dir / "meta" / "stats.json")
-        write_jsonl(episodes_rows, staging_dir / "meta" / "episodes.jsonl")
-        write_jsonl(episodes_stats_rows, staging_dir / "meta" / "episodes_stats.jsonl")
-        write_jsonl(
-            [
-                {"task_index": task_index, "task": task}
-                for task, task_index in sorted(tasks_to_index.items(), key=lambda item: item[1])
-            ],
-            staging_dir / "meta" / "tasks.jsonl",
-        )
+        print("Converting metadata...")
+        convert_info(source_info, staging_dir, episode_records, video_keys)
+        copy_global_stats(src, staging_dir)
+        convert_tasks(tasks, staging_dir)
+        convert_data(src, staging_dir, episode_records, source_info["data_path"], chunks_size)
+        convert_videos(src, staging_dir, episode_records, source_info.get("video_path"), video_keys, chunks_size)
+        convert_episodes_metadata(staging_dir, episode_records)
         write_marker(staging_dir, src, repo_id, "v3.0")
         shutil.move(staging_dir, dst)
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
-
-
-def load_v3_lerobot():
-    repo_root = Path(__file__).resolve().parents[4]
-    local_lerobot_src = repo_root / "lerobot" / "src"
-    if local_lerobot_src.exists():
-        sys.path.insert(0, str(local_lerobot_src))
-        for module_name in list(sys.modules):
-            if module_name == "lerobot" or module_name.startswith("lerobot."):
-                del sys.modules[module_name]
-
-    try:
-        from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION as LEROBOT_CODEBASE_VERSION
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-        from lerobot.datasets.video_utils import encode_video_frames
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to import a LeRobot v3-capable loader for Piper dataset conversion. "
-            "Make sure the local `lerobot/src` tree is available and its dependencies are installed."
-        ) from exc
-
-    if LEROBOT_CODEBASE_VERSION != "v3.0":
-        raise RuntimeError(f"Expected LeRobot v3.0 loader, found {LEROBOT_CODEBASE_VERSION!r}.")
-
-    return LeRobotDataset, LeRobotDatasetMetadata, encode_video_frames
-
-
-def normalize_task(task: object) -> str:
-    if task is None:
-        raise ValueError("Episode frame is missing task metadata.")
-    if isinstance(task, np.ndarray) and task.ndim == 0:
-        task = task.item()
-    if isinstance(task, bytes):
-        task = task.decode("utf-8")
-    task = str(task).strip()
-    if not task:
-        raise ValueError("Episode frame contains an empty task string.")
-    return task
-
-
-def as_float_vector(value: object, key: str) -> np.ndarray:
-    array = np.asarray(value, dtype=np.float32)
-    if array.shape != (7,):
-        raise ValueError(f"{key} must have shape (7,), found {array.shape}.")
-    return array
-
-
-def to_uint8_hwc(value: object, key: str) -> np.ndarray:
-    image = np.asarray(value)
-    if np.issubdtype(image.dtype, np.floating):
-        image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
-    if image.ndim != 3:
-        raise ValueError(f"{key} must have 3 dimensions, found shape {image.shape}.")
-    if image.shape[0] == 3:
-        image = np.transpose(image, (1, 2, 0))
-    if image.shape[-1] != 3:
-        raise ValueError(f"{key} must have 3 channels, found shape {image.shape}.")
-    return image.astype(np.uint8, copy=False)
-
-
-def build_output_features(source_features: dict, base_shape: tuple[int, int, int], wrist_shape: tuple[int, int, int], fps: int) -> dict:
-    return {
-        PIPER_ACTION_KEY: {
-            "dtype": "float32",
-            "shape": list(source_features[PIPER_ACTION_KEY]["shape"]),
-            "names": source_features[PIPER_ACTION_KEY].get("names"),
-        },
-        PIPER_STATE_KEY: {
-            "dtype": "float32",
-            "shape": list(source_features[PIPER_STATE_KEY]["shape"]),
-            "names": source_features[PIPER_STATE_KEY].get("names"),
-        },
-        PIPER_BASE_IMAGE_KEY: make_video_feature(source_features.get(PIPER_BASE_IMAGE_KEY, {}), base_shape, fps),
-        PIPER_WRIST_IMAGE_KEY: make_video_feature(source_features.get(PIPER_WRIST_IMAGE_KEY, {}), wrist_shape, fps),
-        **DEFAULT_FEATURES,
-    }
-
-
-def make_video_feature(source_feature: dict, image_shape: tuple[int, int, int], fps: int) -> dict:
-    height, width, channels = image_shape
-    info = dict(source_feature.get("info", {}))
-    info.update(
-        {
-            "video.height": height,
-            "video.width": width,
-            "video.codec": info.get("video.codec", "av1"),
-            "video.pix_fmt": info.get("video.pix_fmt", "yuv420p"),
-            "video.is_depth_map": info.get("video.is_depth_map", False),
-            "video.fps": fps,
-            "video.channels": channels,
-            "has_audio": info.get("has_audio", False),
-        }
-    )
-    return {
-        "dtype": "video",
-        "shape": [height, width, channels],
-        "names": source_feature.get("names", ["height", "width", "channels"]),
-        "info": info,
-    }
-
-
-def compute_feature_stats(array: np.ndarray) -> dict[str, np.ndarray]:
-    array = np.asarray(array)
-    keepdims = array.ndim == 1
-    return {
-        "min": np.min(array, axis=0, keepdims=keepdims),
-        "max": np.max(array, axis=0, keepdims=keepdims),
-        "mean": np.mean(array, axis=0, keepdims=keepdims),
-        "std": np.std(array, axis=0, keepdims=keepdims),
-        "count": np.asarray([len(array)], dtype=np.int64),
-    }
-
-
-def aggregate_stats(stats_list: list[dict[str, dict[str, np.ndarray]]]) -> dict[str, dict[str, np.ndarray]]:
-    aggregated: dict[str, dict[str, np.ndarray]] = {}
-    for key in {feature_key for stats in stats_list for feature_key in stats}:
-        aggregated[key] = aggregate_feature_stats([stats[key] for stats in stats_list if key in stats])
-    return aggregated
-
-
-def aggregate_feature_stats(feature_stats_list: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
-    means = np.stack([stats["mean"] for stats in feature_stats_list])
-    variances = np.stack([stats["std"] ** 2 for stats in feature_stats_list])
-    counts = np.stack([stats["count"] for stats in feature_stats_list])
-    total_count = counts.sum(axis=0)
-
-    expanded_counts = counts
-    while expanded_counts.ndim < means.ndim:
-        expanded_counts = np.expand_dims(expanded_counts, axis=-1)
-
-    total_mean = (means * expanded_counts).sum(axis=0) / total_count
-    mean_delta = means - total_mean
-    total_variance = ((variances + mean_delta**2) * expanded_counts).sum(axis=0) / total_count
-
-    return {
-        "min": np.min(np.stack([stats["min"] for stats in feature_stats_list]), axis=0),
-        "max": np.max(np.stack([stats["max"] for stats in feature_stats_list]), axis=0),
-        "mean": total_mean,
-        "std": np.sqrt(total_variance),
-        "count": total_count,
-    }
-
-
-def serialize_tree(tree):
-    if isinstance(tree, dict):
-        return {key: serialize_tree(value) for key, value in tree.items()}
-    if isinstance(tree, np.ndarray):
-        return tree.tolist()
-    if isinstance(tree, np.generic):
-        return tree.item()
-    return tree
 
 
 def write_json(data: dict, path: Path) -> None:
@@ -510,22 +479,6 @@ def write_jsonl(rows: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with jsonlines.open(path, mode="w") as writer:
         writer.write_all(rows)
-
-
-def write_episode_parquet(path: Path, columns: dict[str, np.ndarray]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.table(
-        {
-            PIPER_ACTION_KEY: pa.array(columns[PIPER_ACTION_KEY].tolist(), type=pa.list_(pa.float32())),
-            PIPER_STATE_KEY: pa.array(columns[PIPER_STATE_KEY].tolist(), type=pa.list_(pa.float32())),
-            "timestamp": pa.array(columns["timestamp"], type=pa.float32()),
-            "frame_index": pa.array(columns["frame_index"], type=pa.int64()),
-            "episode_index": pa.array(columns["episode_index"], type=pa.int64()),
-            "index": pa.array(columns["index"], type=pa.int64()),
-            "task_index": pa.array(columns["task_index"], type=pa.int64()),
-        }
-    )
-    pq.write_table(table, path)
 
 
 def write_marker(dst: Path, src: Path, repo_id: str, codebase_version: str) -> None:

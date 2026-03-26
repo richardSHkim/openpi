@@ -12,13 +12,13 @@ This example adds a native Piper fine-tuning and serving path for `openpi` using
 
 `third_party/openpi` currently pins LeRobot `v2.1`, while `datasets/richardshkim/piper_banana_v2` is expected to be a `v3.0` dataset. The converter below handles both cases:
 
-- `v2.1` input: validate and copy to `$HF_LEROBOT_HOME/<repo_id>`
-- `v3.0` input: read episode-by-episode with a `v3.0` loader and rewrite a `v2.1` staging dataset
+- `v2.1` input: validate and copy to `<src-basedir>/<repo_id>`
+- `v3.0` input: slice consolidated parquet files with episode metadata and split source videos into a `v2.1` staging dataset
 
 ```bash
 uv run examples/piper/convert_piper_dataset.py \
   --src /path/to/datasets/richardshkim/piper_banana_v2 \
-  --repo-id richardshkim/piper_banana_v2
+  --repo-id richardshkim/piper_banana_v2_openpi
 ```
 
 If your current local source is already a `v2.1` dataset, you can still keep the canonical training repo id:
@@ -26,16 +26,16 @@ If your current local source is already a `v2.1` dataset, you can still keep the
 ```bash
 uv run examples/piper/convert_piper_dataset.py \
   --src /path/to/datasets/richardshkim/piper_banana_v2_v2.1 \
-  --repo-id richardshkim/piper_banana_v2
+  --repo-id richardshkim/piper_banana_v2_openpi
 ```
 
-By default, the staged dataset is written to:
+By default, the staged dataset is written next to the original dataset under the same base directory:
 
 ```bash
-$HF_LEROBOT_HOME/richardshkim/piper_banana_v2
+/path/to/datasets/richardshkim/piper_banana_v2_openpi
 ```
 
-Use `--dst-root /path/to/lerobot_home` if you want a different staging root.
+Use `--dst-root /path/to/output_base` if you want a different staging root.
 
 ## 2. Compute Norm Stats
 
@@ -53,7 +53,7 @@ bash examples/piper/compute_norm_stats.sh
 
 ## 3. Train
 
-`pi05_piper` is registered in [`src/openpi/training/config.py`](../../src/openpi/training/config.py) and points at the staged dataset `richardshkim/piper_banana_v2`.
+`pi05_piper` is registered in [`src/openpi/training/config.py`](../../src/openpi/training/config.py) and points at the staged dataset `richardshkim/piper_banana_v2_openpi`.
 
 Thin wrappers:
 
@@ -64,6 +64,15 @@ bash examples/piper/train.sh
 ```
 
 The wrappers intentionally stay very small and map almost 1:1 to the Python entrypoints.
+`compute_norm_stats.sh` and `train.sh` derive the canonical local repo id from the staged dataset path, which defaults to `datasets/richardshkim/piper_banana_v2_openpi` relative to the project root:
+
+- `PIPER_STAGED_DATASET`: staged v2.1 Piper dataset directory, for example `/path/to/datasets/richardshkim/piper_banana_v2_openpi`
+
+`compute_norm_stats.sh` now uses the `repo_id` and assets directory already defined in the selected config. In the default Piper setup, it writes to `third_party/openpi/assets/pi05_piper/richardshkim/piper_banana_v2_openpi/norm_stats.json`.
+
+`train.sh` refuses to fall back to the Hub and will stop unless the staged dataset from
+`prepare_dataset.sh` and the norm stats from `compute_norm_stats.sh` already exist locally.
+
 Useful overrides:
 
 ```bash
@@ -72,6 +81,11 @@ PIPER_DATASET_SRC=/path/to/datasets/richardshkim/piper_banana_v2 \
 PIPER_FSDP_DEVICES=2 \
 bash examples/piper/prepare_dataset.sh
 
+PIPER_STAGED_DATASET=/tmp/piper_lerobot/richardshkim/piper_banana_v2_openpi \
+bash examples/piper/compute_norm_stats.sh
+
+PIPER_STAGED_DATASET=/tmp/piper_lerobot/richardshkim/piper_banana_v2_openpi \
+PIPER_ASSETS_BASE_DIR=./assets \
 PIPER_EXP_NAME=my_experiment \
 PIPER_FSDP_DEVICES=2 \
 bash examples/piper/train.sh --batch-size 2
@@ -103,13 +117,13 @@ Use checkpoint mode, which is the recommended openpi path for custom embodiments
 uv run scripts/serve_policy.py \
   policy:checkpoint \
   --policy.config=pi05_piper \
-  --policy.dir=checkpoints/pi05_piper/my_experiment/<step>
+  --policy.dir=outputs/openpi/pi05_piper/my_experiment/<step>
 ```
 
 Thin wrapper:
 
 ```bash
-PIPER_POLICY_DIR=checkpoints/pi05_piper/my_experiment/<step> \
+PIPER_POLICY_DIR=outputs/openpi/pi05_piper/my_experiment/<step> \
 bash examples/piper/serve.sh
 ```
 
