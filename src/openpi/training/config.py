@@ -805,20 +805,20 @@ _CONFIGS = [
         name="pi05_piper",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotPiperDataConfig(
-            repo_id="richardshkim/piper_banana_v2",
+            repo_id="richardshkim/piper_banana_v2_openpi",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        batch_size=256,
+        batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=1_000,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
+            decay_steps=100_000,
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=3_000,
     ),
     #
     # Fine-tuning Aloha configs.
