@@ -803,7 +803,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_piper",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotPiperDataConfig(
             repo_id="richardshkim/piper_banana_v2_openpi",
             base_config=DataConfig(prompt_from_task=True),
